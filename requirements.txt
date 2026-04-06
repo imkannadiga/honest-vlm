@@ -1,0 +1,8 @@
+torch
+transformers
+accelerate
+datasets
+opencv-python
+pillow
+einops
+timm
