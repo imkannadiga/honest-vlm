@@ -121,8 +121,6 @@ def _macro_micro_f1_from_cm(cm: np.ndarray) -> Tuple[float, float, List[dict]]:
             precisions.append(p)
             recalls.append(r)
 
-    macro_p = float(np.mean(precisions)) if precisions else 0.0
-    macro_r = float(np.mean(recalls)) if recalls else 0.0
     macro_f1 = float(np.mean(f1s)) if f1s else 0.0
 
     total = cm[:c, :].sum()
@@ -221,6 +219,19 @@ def run_phase1_evaluation(
             for k, v in bucket_stats.items()
         }
 
+        errors_sample: List[Dict[str, str]] = []
+        for s, p in zip(samples, preds):
+            if normalize_label(p) != normalize_label(s["label"]):
+                errors_sample.append(
+                    {
+                        "ground_truth": normalize_label(s["label"]),
+                        "prediction": normalize_label(p),
+                        "prompt": s["prompt"],
+                    }
+                )
+            if len(errors_sample) >= 20:
+                break
+
         return {
             "tag": tag,
             "model_path": model_path,
@@ -233,6 +244,7 @@ def run_phase1_evaluation(
             "confusion_matrix_shape": list(cm.shape),
             "confusion_note": "rows=true_class 0..79, cols=pred_class 0..79 or 80=unknown_pred",
             "accuracy_by_bbox_area_bucket": bucket_accuracy,
+            "errors_sample": errors_sample,
             "predictions": preds,
         }
 

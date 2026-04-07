@@ -1,3 +1,4 @@
+import os
 import torch
 from transformers import AutoProcessor, AutoModelForCausalLM
 from torch.utils.data import DataLoader
@@ -23,6 +24,29 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--save_name", type=str, default=None)
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--skip_phase1_eval",
+        action="store_true",
+        help="If set, skip automatic Phase-1 validation metrics after training.",
+    )
+    parser.add_argument(
+        "--eval_split",
+        type=str,
+        default="validation",
+        help="COCO split for Phase-1 post-training eval (held-out from training).",
+    )
+    parser.add_argument(
+        "--eval_num_samples",
+        type=int,
+        default=500,
+        help="Number of bbox instances for Phase-1 eval (0 disables eval).",
+    )
+    parser.add_argument("--eval_seed", type=int, default=42)
+    parser.add_argument(
+        "--no_eval_baseline",
+        action="store_true",
+        help="Skip baseline (pretrained) comparison in Phase-1 eval (faster).",
+    )
     args = parser.parse_args()
 
     # 1. Initialize multi-node environment with Gradient Accumulation
@@ -126,6 +150,25 @@ def main():
         unwrapped_model.save_pretrained(save_path)
         processor.save_pretrained(save_path)
         print(f"Training complete! Model saved at {save_path}.")
+
+        if (
+            args.phase == "phase1"
+            and not args.skip_phase1_eval
+            and args.eval_num_samples > 0
+        ):
+            from src.phase1_eval import run_phase1_evaluation
+
+            eval_out_dir = os.path.join(save_path, "phase1_eval")
+            run_phase1_evaluation(
+                checkpoint_path=save_path,
+                eval_split=args.eval_split,
+                eval_num_samples=args.eval_num_samples,
+                eval_seed=args.eval_seed,
+                min_bbox_area=args.min_bbox_area,
+                baseline_model_path=None if args.no_eval_baseline else args.model_id,
+                output_dir=eval_out_dir,
+                verbose=True,
+            )
 
 if __name__ == "__main__":
     main()
