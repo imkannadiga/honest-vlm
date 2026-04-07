@@ -4,12 +4,21 @@ from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from torch.optim import AdamW
 from src.dataset import HonestVLMDataset, prepare_honest_vlm_data
+import argparse
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_samples", type=int, default=2000)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--corruption_prob", type=float, default=0.3)
+    args = parser.parse_args()
+
     # 1. Initialize multi-node environment with Gradient Accumulation
     accelerator = Accelerator(gradient_accumulation_steps=4)
     
-    accelerator.print("Loading Florence-2-large...")
+    if accelerator.is_main_process:
+        print("Loading Florence-2-large...")
 
     # 2. Load Model & Processor
     model_id = "microsoft/florence-2-large"
@@ -22,13 +31,17 @@ def main():
 
     # 3. Setup Dataset and Dataloader
     with accelerator.main_process_first():
-        real_data = prepare_honest_vlm_data(num_samples=2000)
+        real_data = prepare_honest_vlm_data(
+            num_samples=args.num_samples,
+            corruption_prob=args.corruption_prob,
+            verbose=accelerator.is_main_process
+        )
     
     dataset = HonestVLMDataset(real_data, processor)
     
     # 2 images per GPU * 4 GPUs = 8 images per step.
     # 8 images * 4 accumulation steps = 32 Effective Global Batch Size.
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
     # 4. Optimizer
     optimizer = AdamW(model.parameters(), lr=1e-5) # Smaller LR for fine-tuning
@@ -39,10 +52,11 @@ def main():
     )
 
     # 6. The Multi-Node Training Loop
-    epochs = 3
+    epochs = args.epochs
     model.train()
     
-    accelerator.print(f"Starting training across {accelerator.num_processes} GPUs!")
+    if accelerator.is_main_process:
+        print(f"Starting training across {accelerator.num_processes} GPUs!")
 
     for epoch in range(epochs):
         for step, batch in enumerate(dataloader):
