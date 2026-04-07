@@ -162,16 +162,12 @@ def main():
         progress_bar = None
         if accelerator.is_main_process:
             progress_bar = tqdm(
-                total=len(train_dataloader),
+                total=(len(train_dataloader) / (accelerator.num_processes * args.batch_size * 4)),
                 desc=f"Epoch {epoch}",
                 leave=True,
                 dynamic_ncols=True,
             )
-        if accelerator.is_main_process:
-            print(
-                f"Epoch {epoch} | train mix: clean={train_clean}, corrupted={train_corrupt}"
-            )
-
+        
         model.train()
         train_loss_sum = 0.0
         train_batches = 0
