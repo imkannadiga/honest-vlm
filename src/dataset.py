@@ -53,7 +53,11 @@ class HonestVLMDataset(Dataset):
 def prepare_honest_vlm_data(num_samples=2000):
     print("Downloading COCO 2017 Validation subset (~1GB)...")
     # This automatically downloads, caches, and loads the 5000 validation images
-    dataset = load_dataset("rafaelpadilla/coco2017", split="val")
+    dataset = load_dataset(
+        "rafaelpadilla/coco2017", 
+        split="val",
+        cache_dir="./cache"
+    )
     
     # Shuffle so we get a random mix of images
     dataset = dataset.shuffle(seed=42).select(range(num_samples))
