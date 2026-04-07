@@ -24,7 +24,7 @@ class HonestVLMDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data_list[idx]
-        image = item["image"]
+        image = item["image"].convert("RGB")
         prompt = item["prompt"]
         text = item["text"]
         
@@ -138,7 +138,7 @@ def _extract_image(item):
     """Get PIL image from either decoded image or HF image dict."""
     image = item.get("image")
     if isinstance(image, Image.Image):
-        return image
+        return image.convert("RGB")
     if isinstance(image, dict):
         if image.get("bytes") is not None:
             return Image.open(io.BytesIO(image["bytes"])).convert("RGB")
