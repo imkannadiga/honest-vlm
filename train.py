@@ -4,6 +4,7 @@ from transformers import AutoProcessor, AutoModelForCausalLM
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from torch.optim import AdamW
+from tqdm.auto import tqdm
 from src.dataset import HonestVLMDataset, prepare_coco_bbox_data
 import argparse
 
@@ -116,6 +117,15 @@ def main():
         print(f"Starting training across {accelerator.num_processes} GPUs!")
 
     for epoch in range(epochs):
+        progress_bar = None
+        if accelerator.is_main_process:
+            total_updates = len(dataloader)
+            progress_bar = tqdm(
+                total=total_updates,
+                desc=f"Epoch {epoch}",
+                leave=True,
+                dynamic_ncols=True,
+            )
         if accelerator.is_main_process:
             print(
                 f"Epoch {epoch} | dataset mix: clean={clean_count}, corrupted={corrupt_count}"
@@ -135,8 +145,13 @@ def main():
                 
             # Log only on Node 0, GPU 0
             if accelerator.sync_gradients and accelerator.is_main_process:
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                    progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
                 if step % 10 == 0:
                     print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
+        if progress_bar is not None:
+            progress_bar.close()
 
     # 7. Safe Checkpointing
     accelerator.wait_for_everyone() # Force Node 1 to wait for Node 0 to finish
