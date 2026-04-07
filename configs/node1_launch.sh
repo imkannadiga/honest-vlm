@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 # Florence-2-large + bf16 on 16GB A4000: start at 4 images per GPU; if CUDA OOM, try 2 or 1.
-PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-2}"
 
 # Optional: export TRAIN_PHASE=phase2 for honest training (loads phase1 checkpoint by default).
 TRAIN_PHASE="${TRAIN_PHASE:-phase1}"
