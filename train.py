@@ -1,17 +1,41 @@
 import os
+import random
+import argparse
+
 import torch
-from transformers import AutoProcessor, AutoModelForCausalLM
-from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from transformers import AutoModelForCausalLM, AutoProcessor
+
 from src.dataset import HonestVLMDataset, prepare_coco_bbox_data
-import argparse
+
+
+def _distributed_mean_scalar(loss: torch.Tensor, accelerator: Accelerator) -> float:
+    """Mean of scalar loss across processes (equal per-device batch sizes)."""
+    x = loss.detach().float()
+    if x.dim() == 0:
+        x = x.unsqueeze(0)
+    gathered = accelerator.gather_for_metrics(x)
+    return float(gathered.mean().item())
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", type=str, choices=["phase1", "phase2"], default="phase1")
-    parser.add_argument("--num_samples", type=int, default=2000)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=0,
+        help="Max bbox instances from COCO split; 0 = use the full split.",
+    )
+    parser.add_argument(
+        "--train_split_ratio",
+        type=float,
+        default=0.8,
+        help="Fraction of prepared samples used for training (rest is held-out test).",
+    )
     parser.add_argument("--coco_split", type=str, default="train")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=3)
@@ -33,7 +57,7 @@ def main():
     parser.add_argument(
         "--eval_split",
         type=str,
-        default="validation",
+        default="val",
         help="COCO split for Phase-1 post-training eval (held-out from training).",
     )
     parser.add_argument(
@@ -58,25 +82,39 @@ def main():
             args.init_model_path = f"{args.output_dir.rstrip('/')}/phase1-recognition"
     load_path = args.init_model_path if args.init_model_path else args.model_id
 
-    # 3. Setup Dataset and Dataloader
+    # 3. Setup Dataset and Dataloader (full COCO split by default, then 80/20 train/test)
+    num_samples = None if args.num_samples <= 0 else args.num_samples
     with accelerator.main_process_first():
-        real_data = prepare_coco_bbox_data(
+        full_data = prepare_coco_bbox_data(
             split=args.coco_split,
-            num_samples=args.num_samples,
+            num_samples=num_samples,
             phase=args.phase,
             corruption_prob=args.corruption_prob,
             blur_radius=args.blur_radius,
             min_bbox_area=args.min_bbox_area,
             seed=args.seed,
-            verbose=accelerator.is_main_process
+            verbose=accelerator.is_main_process,
         )
 
-    clean_count = sum(1 for item in real_data if not item.get("is_corrupted", False))
-    corrupt_count = len(real_data) - clean_count
+    split_rng = random.Random(args.seed)
+    shuffled = full_data.copy()
+    split_rng.shuffle(shuffled)
+    ratio = min(max(args.train_split_ratio, 0.0), 1.0)
+    n_train = int(len(shuffled) * ratio)
+    if n_train <= 0 or n_train >= len(shuffled):
+        raise ValueError(
+            f"Invalid train/test split: n={len(shuffled)}, train_split_ratio={ratio} "
+            f"gives n_train={n_train}. Use a larger dataset or adjust --train_split_ratio."
+        )
+    train_data = shuffled[:n_train]
+    test_data = shuffled[n_train:]
+
+    train_clean = sum(1 for item in train_data if not item.get("is_corrupted", False))
+    train_corrupt = len(train_data) - train_clean
     if accelerator.is_main_process:
         print(
-            f"Prepared {len(real_data)} training samples for {args.phase} "
-            f"(clean={clean_count}, corrupted={corrupt_count})"
+            f"Train/test split: {len(train_data)} train, {len(test_data)} test "
+            f"(ratio={ratio:.2f}). Train mix: clean={train_clean}, corrupted={train_corrupt}"
         )
 
     if args.dry_run:
@@ -95,63 +133,97 @@ def main():
         torch_dtype=torch.bfloat16 # A4000s support bfloat16, saving massive VRAM
     )
 
-    dataset = HonestVLMDataset(real_data, processor)
+    train_dataset = HonestVLMDataset(train_data, processor)
+    test_dataset = HonestVLMDataset(test_data, processor)
 
     # 2 images per GPU * 4 GPUs = 8 images per step.
     # 8 images * 4 accumulation steps = 32 Effective Global Batch Size.
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_dataloader = DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False
+    )
 
     # 4. Optimizer
     optimizer = AdamW(model.parameters(), lr=args.lr) # Smaller LR for fine-tuning
 
     # 5. Distribute everything across the 2 Nodes (4 GPUs)
-    model, optimizer, dataloader = accelerator.prepare(
-        model, optimizer, dataloader
+    model, optimizer, train_dataloader, test_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, test_dataloader
     )
 
     # 6. The Multi-Node Training Loop
     epochs = args.epochs
     model.train()
-    
+
     if accelerator.is_main_process:
         print(f"Starting training across {accelerator.num_processes} GPUs!")
 
     for epoch in range(epochs):
         progress_bar = None
         if accelerator.is_main_process:
-            total_updates = len(dataloader)
             progress_bar = tqdm(
-                total=total_updates,
+                total=len(train_dataloader),
                 desc=f"Epoch {epoch}",
                 leave=True,
                 dynamic_ncols=True,
             )
         if accelerator.is_main_process:
             print(
-                f"Epoch {epoch} | dataset mix: clean={clean_count}, corrupted={corrupt_count}"
+                f"Epoch {epoch} | train mix: clean={train_clean}, corrupted={train_corrupt}"
             )
-        for step, batch in enumerate(dataloader):
+
+        model.train()
+        train_loss_sum = 0.0
+        train_batches = 0
+        for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 pixel_values = batch["pixel_values"].to(dtype=torch.bfloat16)
                 outputs = model(
                     input_ids=batch["input_ids"],
                     pixel_values=pixel_values,
-                    labels=batch["labels"]
+                    labels=batch["labels"],
                 )
                 loss = outputs.loss
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
-                
-            # Log only on Node 0, GPU 0
-            if accelerator.sync_gradients and accelerator.is_main_process:
-                if progress_bar is not None:
-                    progress_bar.update(1)
-                    progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-                if step % 10 == 0:
-                    print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
+
+            batch_mean = _distributed_mean_scalar(loss, accelerator)
+            train_loss_sum += batch_mean
+            train_batches += 1
+
+            if accelerator.is_main_process and progress_bar is not None:
+                progress_bar.update(1)
+                progress_bar.set_postfix({"loss": f"{batch_mean:.4f}"})
+
         if progress_bar is not None:
             progress_bar.close()
+
+        avg_train_loss = train_loss_sum / max(train_batches, 1)
+
+        model.eval()
+        test_loss_sum = 0.0
+        test_batches = 0
+        with torch.no_grad():
+            for batch in test_dataloader:
+                pixel_values = batch["pixel_values"].to(dtype=torch.bfloat16)
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    pixel_values=pixel_values,
+                    labels=batch["labels"],
+                )
+                loss = outputs.loss
+                batch_mean = _distributed_mean_scalar(loss, accelerator)
+                test_loss_sum += batch_mean
+                test_batches += 1
+        avg_test_loss = test_loss_sum / max(test_batches, 1)
+        model.train()
+
+        if accelerator.is_main_process:
+            print(
+                f"Epoch {epoch} | avg train loss: {avg_train_loss:.4f} | "
+                f"avg test loss: {avg_test_loss:.4f}"
+            )
 
     # 7. Safe Checkpointing
     accelerator.wait_for_everyone() # Force Node 1 to wait for Node 0 to finish

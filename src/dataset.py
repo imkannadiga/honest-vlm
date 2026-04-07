@@ -229,6 +229,12 @@ def prepare_coco_bbox_data(
     seed=42,
     verbose=True,
 ):
+    """
+    Build bbox→label samples from COCO 2017 (HF ``detection-datasets/coco``).
+
+    ``num_samples``: max number of bbox instances to emit. If ``num_samples <= 0``,
+    use every valid bbox in the split (full dataset).
+    """
     if verbose:
         print(f"Loading COCO 2017 split={split}...")
     dataset = load_dataset(
@@ -241,6 +247,8 @@ def prepare_coco_bbox_data(
     if phase not in {"phase1", "phase2"}:
         raise ValueError("phase must be one of {'phase1', 'phase2'}")
 
+    unlimited = num_samples is None or int(num_samples) <= 0
+
     indices = list(range(len(dataset)))
     rng.shuffle(indices)
 
@@ -249,7 +257,7 @@ def prepare_coco_bbox_data(
     corrupted_count = 0
 
     for idx in indices:
-        if len(processed_data) >= num_samples:
+        if not unlimited and len(processed_data) >= num_samples:
             break
         item = dataset[idx]
         image = _extract_image(item)
@@ -261,7 +269,7 @@ def prepare_coco_bbox_data(
 
         bboxes, labels = _extract_objects(item)
         for bbox, category_id in zip(bboxes, labels):
-            if len(processed_data) >= num_samples:
+            if not unlimited and len(processed_data) >= num_samples:
                 break
             if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
                 continue

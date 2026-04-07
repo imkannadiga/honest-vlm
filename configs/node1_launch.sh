@@ -23,6 +23,5 @@ accelerate launch \
     --coco_split train \
     --batch_size "${PER_DEVICE_BATCH}" \
     --epochs 10 \
-    --num_samples 2000 \
     --output_dir ./checkpoints \
     --no_eval_baseline
