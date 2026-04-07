@@ -1,4 +1,5 @@
 import os
+import pickle
 import random
 import argparse
 
@@ -10,6 +11,61 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor
 
 from src.dataset import HonestVLMDataset, prepare_coco_bbox_data
+
+
+def _coco_prepared_cache_path(cache_dir: str, args, num_samples) -> str:
+    """Stable filename so different prep settings do not collide."""
+    ns = "full" if num_samples is None else str(int(num_samples))
+    name = (
+        f"coco_split-{args.coco_split}_ns-{ns}_ph-{args.phase}_"
+        f"cp-{args.corruption_prob}_br-{args.blur_radius}_"
+        f"mba-{args.min_bbox_area}_seed-{args.seed}.pkl"
+    )
+    return os.path.join(cache_dir, name)
+
+
+def _load_or_prepare_coco_bbox_data(accelerator: Accelerator, args, num_samples):
+    """
+    Single-writer preparation on shared storage: main process builds or refreshes the cache;
+    all ranks load the same pickled list so COCO prep is not repeated on every process.
+    """
+    os.makedirs(args.prepared_data_cache_dir, exist_ok=True)
+    cache_path = _coco_prepared_cache_path(args.prepared_data_cache_dir, args, num_samples)
+    tmp_path = cache_path + ".tmp"
+
+    if accelerator.is_main_process:
+        if os.path.isfile(cache_path) and not args.prepared_data_force_refresh:
+            print(f"Loading prepared COCO data from cache: {cache_path}")
+            with open(cache_path, "rb") as f:
+                full_data = pickle.load(f)
+        else:
+            if args.prepared_data_force_refresh and os.path.isfile(cache_path):
+                print(
+                    f"Refreshing prepared COCO cache (--prepared_data_force_refresh): "
+                    f"{cache_path}"
+                )
+            full_data = prepare_coco_bbox_data(
+                split=args.coco_split,
+                num_samples=num_samples,
+                phase=args.phase,
+                corruption_prob=args.corruption_prob,
+                blur_radius=args.blur_radius,
+                min_bbox_area=args.min_bbox_area,
+                seed=args.seed,
+                verbose=True,
+            )
+            with open(tmp_path, "wb") as f:
+                pickle.dump(full_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, cache_path)
+            print(f"Saved prepared COCO data to cache: {cache_path}")
+
+    accelerator.wait_for_everyone()
+
+    if not accelerator.is_main_process:
+        with open(cache_path, "rb") as f:
+            full_data = pickle.load(f)
+
+    return full_data
 
 
 def _distributed_mean_scalar(loss: torch.Tensor, accelerator: Accelerator) -> float:
@@ -72,6 +128,17 @@ def main():
         action="store_true",
         help="Skip baseline (pretrained) comparison in Phase-1 eval (faster).",
     )
+    parser.add_argument(
+        "--prepared_data_cache_dir",
+        type=str,
+        default="./data/prepared_coco_cache",
+        help="Shared directory for pickled prepared COCO bbox samples (safe for multi-node).",
+    )
+    parser.add_argument(
+        "--prepared_data_force_refresh",
+        action="store_true",
+        help="Rebuild prepared data and overwrite the cache file for this config.",
+    )
     args = parser.parse_args()
 
     # 1. Initialize multi-node environment with Gradient Accumulation
@@ -84,17 +151,7 @@ def main():
 
     # 3. Setup Dataset and Dataloader (full COCO split by default, then 80/20 train/test)
     num_samples = None if args.num_samples <= 0 else args.num_samples
-    with accelerator.main_process_first():
-        full_data = prepare_coco_bbox_data(
-            split=args.coco_split,
-            num_samples=num_samples,
-            phase=args.phase,
-            corruption_prob=args.corruption_prob,
-            blur_radius=args.blur_radius,
-            min_bbox_area=args.min_bbox_area,
-            seed=args.seed,
-            verbose=accelerator.is_main_process,
-        )
+    full_data = _load_or_prepare_coco_bbox_data(accelerator, args, num_samples)
 
     split_rng = random.Random(args.seed)
     shuffled = full_data.copy()

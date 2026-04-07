@@ -15,6 +15,9 @@ PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
 # Optional: export TRAIN_PHASE=phase2 for honest training (loads phase1 checkpoint by default).
 TRAIN_PHASE="${TRAIN_PHASE:-phase1}"
 
+# Shared prepared COCO pickle cache (multi-node); override if your cluster path differs.
+PREPARED_DATA_CACHE_DIR="${PREPARED_DATA_CACHE_DIR:-/netpool/homes/hathreya/honest-vlm/cache}"
+
 accelerate launch \
     --num_processes=4 \
     --num_machines=2 \
@@ -27,4 +30,5 @@ accelerate launch \
     --batch_size "${PER_DEVICE_BATCH}" \
     --epochs 10 \
     --output_dir ./checkpoints \
+    --prepared_data_cache_dir "${PREPARED_DATA_CACHE_DIR}" \
     --no_eval_baseline
