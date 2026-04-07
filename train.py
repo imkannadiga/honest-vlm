@@ -61,9 +61,10 @@ def main():
     for epoch in range(epochs):
         for step, batch in enumerate(dataloader):
             with accelerator.accumulate(model):
+                pixel_values = batch["pixel_values"].to(dtype=torch.bfloat16)
                 outputs = model(
                     input_ids=batch["input_ids"],
-                    pixel_values=batch["pixel_values"],
+                    pixel_values=pixel_values,
                     labels=batch["labels"]
                 )
                 loss = outputs.loss
