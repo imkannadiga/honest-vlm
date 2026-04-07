@@ -54,16 +54,44 @@ def blur_image(image, radius=8.0):
     return image.convert("RGB").filter(ImageFilter.GaussianBlur(radius=radius))
 
 
+def generate_answer(model, processor, question, image):
+    inputs = processor(text=question, images=image, return_tensors="pt").to(
+        "cuda", torch.bfloat16
+    )
+    with torch.no_grad():
+        generated_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=80,
+            do_sample=False,
+        )
+    return processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+
+
 def run_evaluation(num_samples=20, blur_radius=8.0):
-    print("Loading model...")
-    model_path = "./honest-vlm-checkpoint"
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
+    print("Loading baseline model...")
+    baseline_model_path = "microsoft/florence-2-large"
+    baseline_processor = AutoProcessor.from_pretrained(
+        baseline_model_path, trust_remote_code=True
+    )
+    baseline_model = AutoModelForCausalLM.from_pretrained(
+        baseline_model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
     ).cuda()
-    model.eval()
+    baseline_model.eval()
+
+    print("Loading fine-tuned model...")
+    finetuned_model_path = "./honest-vlm-checkpoint"
+    finetuned_processor = AutoProcessor.from_pretrained(
+        finetuned_model_path, trust_remote_code=True
+    )
+    finetuned_model = AutoModelForCausalLM.from_pretrained(
+        finetuned_model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+    ).cuda()
+    finetuned_model.eval()
 
     print("Loading RLHF-V dataset...")
     dataset = load_dataset(
@@ -92,26 +120,22 @@ def run_evaluation(num_samples=20, blur_radius=8.0):
             image_path = os.path.join(image_dir, image_name)
             blurred.save(image_path)
 
-            inputs = processor(text=question, images=blurred, return_tensors="pt").to(
-                "cuda", torch.bfloat16
+            baseline_output = generate_answer(
+                baseline_model, baseline_processor, question, blurred
             )
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    max_new_tokens=80,
-                    do_sample=False,
-                )
-            model_output = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+            finetuned_output = generate_answer(
+                finetuned_model, finetuned_processor, question, blurred
+            )
 
             row = {
                 "dataset_index": int(idx),
                 "question": question,
                 "blurred_image_path": image_path,
-                "model_output": model_output,
+                "baseline_output": baseline_output,
+                "finetuned_output": finetuned_output,
             }
             f.write(json.dumps(row, ensure_ascii=True) + "\n")
-            print(f"[{i + 1}/{len(indices)}] saved {image_name}")
+            print(f"[{i + 1}/{len(indices)}] compared {image_name}")
 
     print(f"Saved outputs to {output_dir}")
 
