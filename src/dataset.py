@@ -100,7 +100,7 @@ def prepare_honest_vlm_data(num_samples=2000):
     dataset = load_dataset(
         "openbmb/RLHF-V-Dataset",
         split="train",
-        cache_dir="./cache"
+        cache_dir="/netpool/homes/hathreya/honest-vlm/cache"
     )
     
     # Shuffle so we get a random mix of samples
