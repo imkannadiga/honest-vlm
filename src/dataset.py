@@ -10,6 +10,10 @@ class HonestVLMDataset(Dataset):
         """
         self.data_list = data_list
         self.processor = processor
+        # Florence-2 injects image tokens into the sequence. A tiny max_length
+        # (e.g. 128) can become negative after internal accounting.
+        self.input_max_length = 1024
+        self.label_max_length = 128
 
     def __len__(self):
         return len(self.data_list)
@@ -28,7 +32,7 @@ class HonestVLMDataset(Dataset):
             images=image, 
             return_tensors="pt", 
             padding="max_length", 
-            max_length=128, 
+            max_length=self.input_max_length,
             truncation=True
         )
         
@@ -37,7 +41,7 @@ class HonestVLMDataset(Dataset):
             text=text, 
             return_tensors="pt", 
             padding="max_length", 
-            max_length=128, 
+            max_length=self.label_max_length,
             truncation=True
         ).input_ids
 
