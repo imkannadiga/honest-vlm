@@ -1,6 +1,7 @@
 import os
 import random
 import argparse
+from typing import NoReturn
 
 import torch
 from accelerate import Accelerator
@@ -43,7 +44,7 @@ def main():
     parser.add_argument("--blur_radius", type=float, default=8.0)
     parser.add_argument("--min_bbox_area", type=float, default=32.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--model_id", type=str, default="microsoft/florence-2-large")
     parser.add_argument("--init_model_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
@@ -162,7 +163,7 @@ def main():
         progress_bar = None
         if accelerator.is_main_process:
             progress_bar = tqdm(
-                total=(len(train_dataloader) / (accelerator.num_processes * args.batch_size * 4)),
+                total=(len(train_dataloader) / (accelerator.num_processes * 4)),
                 desc=f"Epoch {epoch}",
                 leave=True,
                 dynamic_ncols=True,
@@ -192,10 +193,9 @@ def main():
                 progress_bar.update(1)
                 progress_bar.set_postfix({"loss": f"{batch_mean:.4f}"})
 
+        avg_train_loss = train_loss_sum / max(train_batches, 1)
         if progress_bar is not None:
             progress_bar.close()
-
-        avg_train_loss = train_loss_sum / max(train_batches, 1)
 
         model.eval()
         test_loss_sum = 0.0
