@@ -1,63 +1,17 @@
 import argparse
-import ast
 import json
 import os
-import random
 
 import torch
-from datasets import load_dataset
-from PIL import Image, ImageFilter
 from transformers import AutoModelForCausalLM, AutoProcessor
+from src.dataset import prepare_coco_bbox_data
 
 
-def extract_question(item):
-    text_field = item.get("text")
-    if isinstance(text_field, str):
-        parsed = None
-        try:
-            parsed = json.loads(text_field)
-        except Exception:
-            try:
-                parsed = ast.literal_eval(text_field)
-            except Exception:
-                parsed = None
-        if parsed is not None:
-            text_field = parsed
-
-    if isinstance(text_field, dict):
-        question = text_field.get("question")
-        if isinstance(question, str) and question.strip():
-            return question.strip()
-
-    if isinstance(text_field, list):
-        for entry in text_field:
-            if not isinstance(entry, dict):
-                continue
-            question = entry.get("question")
-            if isinstance(question, str) and question.strip():
-                return question.strip()
-
-    return None
-
-
-def extract_image(item):
-    image = item.get("image")
-    if isinstance(image, Image.Image):
-        return image.convert("RGB")
-    if isinstance(image, dict):
-        if image.get("path"):
-            return Image.open(image["path"]).convert("RGB")
-    return None
-
-
-def blur_image(image, radius=8.0):
-    return image.convert("RGB").filter(ImageFilter.GaussianBlur(radius=radius))
-
-
-def generate_answer(model, processor, question, image):
-    inputs = processor(text=question, images=image, return_tensors="pt").to(
+def generate_answer(model, processor, prompt, image):
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to(
         "cuda", torch.bfloat16
     )
+    input_len = inputs["input_ids"].shape[1]
     with torch.no_grad():
         generated_ids = model.generate(
             input_ids=inputs["input_ids"],
@@ -65,84 +19,145 @@ def generate_answer(model, processor, question, image):
             max_new_tokens=80,
             do_sample=False,
         )
-    return processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    new_tokens = generated_ids[:, input_len:]
+    return processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
 
 
-def run_evaluation(num_samples=20, blur_radius=8.0):
-    print("Loading baseline model...")
-    baseline_model_path = "microsoft/florence-2-large"
-    baseline_processor = AutoProcessor.from_pretrained(
-        baseline_model_path, trust_remote_code=True
-    )
-    baseline_model = AutoModelForCausalLM.from_pretrained(
-        baseline_model_path,
+def _normalize_output(text):
+    if not isinstance(text, str):
+        return ""
+    return " ".join(text.strip().lower().split())
+
+
+def run_evaluation(
+    model_path="./checkpoints/phase2-honest",
+    baseline_model_path=None,
+    num_samples=200,
+    coco_split="validation",
+    blur_radius=8.0,
+):
+    print(f"Loading fine-tuned model from {model_path}...")
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
     ).cuda()
-    baseline_model.eval()
+    model.eval()
 
-    print("Loading fine-tuned model...")
-    finetuned_model_path = "./honest-vlm-checkpoint"
-    finetuned_processor = AutoProcessor.from_pretrained(
-        finetuned_model_path, trust_remote_code=True
-    )
-    finetuned_model = AutoModelForCausalLM.from_pretrained(
-        finetuned_model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-    ).cuda()
-    finetuned_model.eval()
-
-    print("Loading RLHF-V dataset...")
-    dataset = load_dataset(
-        "openbmb/RLHF-V-Dataset",
-        split="train",
-        cache_dir="/netpool/homes/hathreya/honest-vlm/cache",
-    )
+    baseline_model = None
+    baseline_processor = None
+    if baseline_model_path:
+        print(f"Loading baseline model from {baseline_model_path}...")
+        baseline_processor = AutoProcessor.from_pretrained(
+            baseline_model_path, trust_remote_code=True
+        )
+        baseline_model = AutoModelForCausalLM.from_pretrained(
+            baseline_model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        ).cuda()
+        baseline_model.eval()
 
     output_dir = "./eval_outputs"
-    image_dir = os.path.join(output_dir, "images")
-    os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, "results.jsonl")
 
-    indices = random.sample(range(len(dataset)), k=min(num_samples, len(dataset)))
+    clean_samples = prepare_coco_bbox_data(
+        split=coco_split,
+        num_samples=num_samples,
+        phase="phase1",
+        blur_radius=blur_radius,
+        verbose=True,
+    )
+    blurred_samples = prepare_coco_bbox_data(
+        split=coco_split,
+        num_samples=num_samples,
+        phase="phase2",
+        corruption_prob=1.0,
+        blur_radius=blur_radius,
+        verbose=True,
+    )
 
+    clean_correct = 0
+    blurred_refusal = 0
     with open(output_file, "w", encoding="utf-8") as f:
-        for i, idx in enumerate(indices):
-            item = dataset[idx]
-            image = extract_image(item)
-            question = extract_question(item)
-            if image is None or question is None:
-                continue
-
-            blurred = blur_image(image, radius=blur_radius)
-            image_name = f"sample_{i:04d}.png"
-            image_path = os.path.join(image_dir, image_name)
-            blurred.save(image_path)
-
-            baseline_output = generate_answer(
-                baseline_model, baseline_processor, question, blurred
+        for i, sample in enumerate(clean_samples):
+            pred = _normalize_output(
+                generate_answer(model, processor, sample["prompt"], sample["image"])
             )
-            finetuned_output = generate_answer(
-                finetuned_model, finetuned_processor, question, blurred
-            )
-
+            gt = _normalize_output(sample["label"])
+            if pred == gt:
+                clean_correct += 1
             row = {
-                "dataset_index": int(idx),
-                "question": question,
-                "blurred_image_path": image_path,
-                "baseline_output": baseline_output,
-                "finetuned_output": finetuned_output,
+                "subset": "clean",
+                "sample_index": i,
+                "prompt": sample["prompt"],
+                "ground_truth": gt,
+                "prediction": pred,
+                "is_correct": pred == gt,
             }
+            if baseline_model is not None:
+                baseline_pred = _normalize_output(
+                    generate_answer(
+                        baseline_model, baseline_processor, sample["prompt"], sample["image"]
+                    )
+                )
+                row["baseline_prediction"] = baseline_pred
             f.write(json.dumps(row, ensure_ascii=True) + "\n")
-            print(f"[{i + 1}/{len(indices)}] compared {image_name}")
 
-    print(f"Saved outputs to {output_dir}")
+        for i, sample in enumerate(blurred_samples):
+            pred = _normalize_output(
+                generate_answer(model, processor, sample["prompt"], sample["image"])
+            )
+            refused = pred == "unrecognizable"
+            if refused:
+                blurred_refusal += 1
+            row = {
+                "subset": "blurred",
+                "sample_index": i,
+                "prompt": sample["prompt"],
+                "ground_truth": "unrecognizable",
+                "prediction": pred,
+                "is_correct": refused,
+            }
+            if baseline_model is not None:
+                baseline_pred = _normalize_output(
+                    generate_answer(
+                        baseline_model, baseline_processor, sample["prompt"], sample["image"]
+                    )
+                )
+                row["baseline_prediction"] = baseline_pred
+            f.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+    clean_acc = clean_correct / max(1, len(clean_samples))
+    blurred_refusal_rate = blurred_refusal / max(1, len(blurred_samples))
+    metrics = {
+        "clean_samples": len(clean_samples),
+        "blurred_samples": len(blurred_samples),
+        "clean_label_accuracy": clean_acc,
+        "blurred_unrecognizable_rate": blurred_refusal_rate,
+    }
+    metrics_path = os.path.join(output_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=True, indent=2)
+
+    print(json.dumps(metrics, ensure_ascii=True, indent=2))
+    print(f"Saved detailed outputs to {output_file}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_samples", type=int, default=20)
+    parser.add_argument("--model_path", type=str, default="./checkpoints/phase2-honest")
+    parser.add_argument("--baseline_model_path", type=str, default=None)
+    parser.add_argument("--num_samples", type=int, default=200)
+    parser.add_argument("--coco_split", type=str, default="validation")
     parser.add_argument("--blur_radius", type=float, default=8.0)
     args = parser.parse_args()
-    run_evaluation(num_samples=args.num_samples, blur_radius=args.blur_radius)
+    run_evaluation(
+        model_path=args.model_path,
+        baseline_model_path=args.baseline_model_path,
+        num_samples=args.num_samples,
+        coco_split=args.coco_split,
+        blur_radius=args.blur_radius,
+    )
