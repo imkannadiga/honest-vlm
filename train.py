@@ -163,7 +163,7 @@ def main():
         progress_bar = None
         if accelerator.is_main_process:
             progress_bar = tqdm(
-                total=(len(train_dataloader) / (accelerator.num_processes * 4)),
+                total=len(train_dataloader),
                 desc=f"Epoch {epoch}",
                 leave=True,
                 dynamic_ncols=True,
@@ -191,7 +191,7 @@ def main():
             train_batches += 1
 
             if accelerator.is_main_process and progress_bar is not None:
-                progress_bar.update(1)
+                progress_bar.update(len(batch))
                 progress_bar.set_postfix({"loss": f"{batch_mean:.4f}"})
 
         avg_train_loss = train_loss_sum / max(train_batches, 1)
