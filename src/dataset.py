@@ -212,7 +212,11 @@ def _extract_objects(item):
     return [], []
 
 
-def _format_bbox_prompt(x1, y1, x2, y2):
+def _format_bbox_prompt(x1, y1, x2, y2, width, height):
+    x1_q = int(x1 / width * 999)
+    y1_q = int(y1 / height * 999)
+    x2_q = int(x2 / width * 999)
+    y2_q = int(y2 / height * 999)
     return (
         f"Given bbox [{x1},{y1},{x2},{y2}], "
         "name the object category with one word."
@@ -292,7 +296,7 @@ def prepare_coco_bbox_data(
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            prompt = _format_bbox_prompt(x1, y1, x2, y2)
+            prompt = _format_bbox_prompt(x1, y1, x2, y2, width, height)
             should_corrupt = (phase == "phase2") and (rng.random() < corruption_prob)
 
             if should_corrupt:

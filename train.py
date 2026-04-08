@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--blur_radius", type=float, default=8.0)
     parser.add_argument("--min_bbox_area", type=float, default=32.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--model_id", type=str, default="microsoft/florence-2-large")
     parser.add_argument("--init_model_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
@@ -182,6 +182,7 @@ def main():
                 )
                 loss = outputs.loss
                 accelerator.backward(loss)
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
