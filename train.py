@@ -1,20 +1,23 @@
 import os
 import random
 import argparse
-from typing import NoReturn
-
 import torch
 from accelerate import Accelerator
+from accelerate.utils import broadcast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-from src.dataset import HonestVLMDataset, prepare_coco_bbox_data
+from src.dataset import (
+    HonestVLMDataset,
+    prepare_coco_bbox_data,
+    train_test_split_by_image_id,
+)
 
 
 def _distributed_mean_scalar(loss: torch.Tensor, accelerator: Accelerator) -> float:
-    """Mean of scalar loss across processes (equal per-device batch sizes)."""
+    """Per-step loss for progress bars (local batch)."""
     x = loss.detach().float()
     if x.dim() == 0:
         x = x.unsqueeze(0)
@@ -35,7 +38,33 @@ def main():
         "--train_split_ratio",
         type=float,
         default=0.8,
-        help="Fraction of prepared samples used for training (rest is held-out test).",
+        help="Fraction used for training. With split_mode=image, this applies to images.",
+    )
+    parser.add_argument(
+        "--split_mode",
+        type=str,
+        choices=["image", "instance"],
+        default="image",
+        help="image: no same-image leakage between train and test (recommended). "
+        "instance: random bbox split (can leak pixels; inflates test quality).",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.01,
+        help="AdamW weight decay (L2 regularization). Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=0,
+        help="Stop after this many epochs without test-loss improvement (0 = disabled).",
+    )
+    parser.add_argument(
+        "--early_stopping_min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum test-loss improvement to reset patience.",
     )
     parser.add_argument("--coco_split", type=str, default="train")
     parser.add_argument("--batch_size", type=int, default=2)
@@ -97,18 +126,26 @@ def main():
             verbose=accelerator.is_main_process,
         )
 
-    split_rng = random.Random(args.seed)
-    shuffled = full_data.copy()
-    split_rng.shuffle(shuffled)
     ratio = min(max(args.train_split_ratio, 0.0), 1.0)
-    n_train = int(len(shuffled) * ratio)
-    if n_train <= 0 or n_train >= len(shuffled):
-        raise ValueError(
-            f"Invalid train/test split: n={len(shuffled)}, train_split_ratio={ratio} "
-            f"gives n_train={n_train}. Use a larger dataset or adjust --train_split_ratio."
+    if args.split_mode == "image":
+        train_data, test_data = train_test_split_by_image_id(
+            full_data,
+            train_ratio=ratio,
+            seed=args.seed,
+            verbose=accelerator.is_main_process,
         )
-    train_data = shuffled[:n_train]
-    test_data = shuffled[n_train:]
+    else:
+        split_rng = random.Random(args.seed)
+        shuffled = full_data.copy()
+        split_rng.shuffle(shuffled)
+        n_train = int(len(shuffled) * ratio)
+        if n_train <= 0 or n_train >= len(shuffled):
+            raise ValueError(
+                f"Invalid train/test split: n={len(shuffled)}, train_split_ratio={ratio} "
+                f"gives n_train={n_train}. Use a larger dataset or adjust --train_split_ratio."
+            )
+        train_data = shuffled[:n_train]
+        test_data = shuffled[n_train:]
 
     train_clean = sum(1 for item in train_data if not item.get("is_corrupted", False))
     train_corrupt = len(train_data) - train_clean
@@ -144,8 +181,12 @@ def main():
         test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False
     )
 
-    # 4. Optimizer
-    optimizer = AdamW(model.parameters(), lr=args.lr) # Smaller LR for fine-tuning
+    # 4. Optimizer (weight decay helps generalization vs training-set memorization)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
     # 5. Distribute everything across the 2 Nodes (4 GPUs)
     model, optimizer, train_dataloader, test_dataloader = accelerator.prepare(
@@ -156,8 +197,20 @@ def main():
     epochs = args.epochs
     model.train()
 
+    if args.save_name is None:
+        args.save_name = "phase1-recognition" if args.phase == "phase1" else "phase2-honest"
+    save_path = f"{args.output_dir.rstrip('/')}/{args.save_name}"
+
+    best_test_loss = float("inf")
+    epochs_without_improvement = 0
+    saved_best = False
+
     if accelerator.is_main_process:
         print(f"Starting training across {accelerator.num_processes} GPUs!")
+        print(
+            f"Checkpoints: save on test-loss improvement only → {save_path} "
+            f"(early_stopping_patience={args.early_stopping_patience})"
+        )
 
     for epoch in range(epochs):
         progress_bar = None
@@ -170,8 +223,8 @@ def main():
             )
         
         model.train()
-        train_loss_sum = 0.0
-        train_batches = 0
+        epoch_loss_w = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+        epoch_loss_n = torch.zeros((), device=accelerator.device, dtype=torch.float32)
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 pixel_values = batch["pixel_values"].to(dtype=torch.bfloat16)
@@ -186,21 +239,24 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
 
-            batch_mean = _distributed_mean_scalar(loss, accelerator)
-            train_loss_sum += batch_mean
-            train_batches += 1
+            n_valid = (batch["labels"] != -100).to(torch.float32).sum()
+            epoch_loss_w += loss.detach().float() * n_valid
+            epoch_loss_n += n_valid
 
+            batch_mean = _distributed_mean_scalar(loss, accelerator)
             if accelerator.is_main_process and progress_bar is not None:
-                progress_bar.update(len(batch))
+                progress_bar.update(1)
                 progress_bar.set_postfix({"loss": f"{batch_mean:.4f}"})
 
-        avg_train_loss = train_loss_sum / max(train_batches, 1)
+        epoch_loss_w = accelerator.reduce(epoch_loss_w, reduction="sum")
+        epoch_loss_n = accelerator.reduce(epoch_loss_n, reduction="sum")
+        avg_train_loss = (epoch_loss_w / epoch_loss_n.clamp(min=1.0)).item()
         if progress_bar is not None:
             progress_bar.close()
 
         model.eval()
-        test_loss_sum = 0.0
-        test_batches = 0
+        test_loss_w = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+        test_loss_n = torch.zeros((), device=accelerator.device, dtype=torch.float32)
         with torch.no_grad():
             for batch in test_dataloader:
                 pixel_values = batch["pixel_values"].to(dtype=torch.bfloat16)
@@ -210,10 +266,12 @@ def main():
                     labels=batch["labels"],
                 )
                 loss = outputs.loss
-                batch_mean = _distributed_mean_scalar(loss, accelerator)
-                test_loss_sum += batch_mean
-                test_batches += 1
-        avg_test_loss = test_loss_sum / max(test_batches, 1)
+                n_valid = (batch["labels"] != -100).to(torch.float32).sum()
+                test_loss_w += loss.detach().float() * n_valid
+                test_loss_n += n_valid
+        test_loss_w = accelerator.reduce(test_loss_w, reduction="sum")
+        test_loss_n = accelerator.reduce(test_loss_n, reduction="sum")
+        avg_test_loss = (test_loss_w / test_loss_n.clamp(min=1.0)).item()
         model.train()
 
         if accelerator.is_main_process:
@@ -221,19 +279,47 @@ def main():
                 f"Epoch {epoch} | avg train loss: {avg_train_loss:.4f} | "
                 f"avg test loss: {avg_test_loss:.4f}"
             )
+            if avg_test_loss < best_test_loss - args.early_stopping_min_delta:
+                best_test_loss = avg_test_loss
+                epochs_without_improvement = 0
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save_pretrained(save_path)
+                processor.save_pretrained(save_path)
+                saved_best = True
+                print(
+                    f"  → New best test loss {best_test_loss:.4f}; checkpoint saved to {save_path}"
+                )
+            else:
+                epochs_without_improvement += 1
 
-    # 7. Safe Checkpointing
+        # Rank 0 decides early stop; broadcast so all ranks leave the loop together.
+        stop_flag = torch.zeros(1, dtype=torch.int32, device=accelerator.device)
+        if accelerator.is_main_process:
+            if (
+                args.early_stopping_patience > 0
+                and epochs_without_improvement >= args.early_stopping_patience
+            ):
+                stop_flag[0] = 1
+        stop_flag = broadcast(stop_flag, from_process=0)
+        if int(stop_flag.item()) == 1:
+            if accelerator.is_main_process:
+                print("Early stopping triggered (no test-loss improvement).")
+            break
+
+    # 7. Safe Checkpointing (best model already on disk when improved)
     accelerator.wait_for_everyone() # Force Node 1 to wait for Node 0 to finish
     unwrapped_model = accelerator.unwrap_model(model)
 
-    if args.save_name is None:
-        args.save_name = "phase1-recognition" if args.phase == "phase1" else "phase2-honest"
-    save_path = f"{args.output_dir.rstrip('/')}/{args.save_name}"
-
     if accelerator.is_main_process:
-        unwrapped_model.save_pretrained(save_path)
-        processor.save_pretrained(save_path)
-        print(f"Training complete! Model saved at {save_path}.")
+        if not saved_best:
+            unwrapped_model.save_pretrained(save_path)
+            processor.save_pretrained(save_path)
+            print(f"Training complete! Model saved at {save_path} (no test improvement logged).")
+        else:
+            print(
+                f"Training complete! Best test loss {best_test_loss:.4f}; "
+                f"checkpoint at {save_path}"
+            )
 
         if (
             args.phase == "phase1"

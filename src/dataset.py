@@ -1,3 +1,4 @@
+from collections import defaultdict
 from torch.utils.data import Dataset
 from datasets import load_dataset
 import numpy as np
@@ -311,6 +312,7 @@ def prepare_coco_bbox_data(
             processed_data.append(
                 {
                     "image": final_image,
+                    "image_id": item.get("image_id", idx),
                     "prompt": prompt,
                     "text": text,
                     "is_corrupted": is_corrupted,
@@ -328,6 +330,54 @@ def prepare_coco_bbox_data(
             f"({clean_count} clean, {corrupted_count} corrupted) for {phase}."
         )
     return processed_data
+
+
+def train_test_split_by_image_id(
+    samples: list,
+    train_ratio: float,
+    seed: int,
+    verbose: bool = True,
+) -> tuple:
+    """
+    Split so all bbox instances from one COCO image stay in train **or** test.
+
+    A random **instance-level** split leaks the same image (and pixels) into both
+    splits, which inflates test scores and looks like severe overfitting.
+    """
+    ratio = min(max(float(train_ratio), 0.0), 1.0)
+    by_image = defaultdict(list)
+    for s in samples:
+        iid = s.get("image_id", id(s))
+        by_image[iid].append(s)
+
+    rng = random.Random(seed)
+    image_ids = list(by_image.keys())
+    rng.shuffle(image_ids)
+
+    n_img = len(image_ids)
+    if n_img < 2:
+        raise ValueError(
+            "Image-level train/test split needs at least 2 distinct image_id values. "
+            "Increase --num_samples or use a split mode that includes more images."
+        )
+
+    n_train_img = int(round(n_img * ratio))
+    n_train_img = max(1, min(n_img - 1, n_train_img))
+
+    train_ids = set(image_ids[:n_train_img])
+    train_data = []
+    test_data = []
+    for iid in image_ids:
+        bucket = train_data if iid in train_ids else test_data
+        bucket.extend(by_image[iid])
+
+    if verbose:
+        print(
+            f"Image-level split: {n_train_img}/{n_img} images → "
+            f"{len(train_data)} train instances, {len(test_data)} test instances "
+            f"(target ratio≈{ratio:.2f})."
+        )
+    return train_data, test_data
 
 
 def prepare_honest_vlm_data(num_samples=2000, corruption_prob=0.3, verbose=True):

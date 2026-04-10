@@ -162,7 +162,7 @@ def _macro_micro_f1_from_cm(cm: np.ndarray) -> Tuple[float, float, List[dict]]:
 
 def run_phase1_evaluation(
     checkpoint_path: str,
-    eval_split: str = "validation",
+    eval_split: str = "val",
     eval_num_samples: int = 500,
     eval_seed: int = 42,
     min_bbox_area: float = 32.0,

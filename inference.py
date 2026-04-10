@@ -33,7 +33,7 @@ def run_evaluation(
     model_path="./checkpoints/phase2-honest",
     baseline_model_path=None,
     num_samples=200,
-    coco_split="validation",
+    coco_split="val",
     blur_radius=8.0,
 ):
     print(f"Loading fine-tuned model from {model_path}...")
@@ -151,7 +151,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default="./checkpoints/phase2-honest")
     parser.add_argument("--baseline_model_path", type=str, default=None)
     parser.add_argument("--num_samples", type=int, default=200)
-    parser.add_argument("--coco_split", type=str, default="validation")
+    parser.add_argument("--coco_split", type=str, default="val")
     parser.add_argument("--blur_radius", type=float, default=8.0)
     args = parser.parse_args()
     run_evaluation(
