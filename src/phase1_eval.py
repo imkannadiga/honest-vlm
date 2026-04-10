@@ -35,6 +35,35 @@ def pred_to_class_index(pred_norm: str) -> int:
     return m.get(pred_norm, 80)
 
 
+def extract_predicted_class(pred_raw: str) -> str:
+    """
+    Map free-form model output to a COCO class label when possible.
+    Falls back to empty string if no class name can be recovered.
+    """
+    pred_norm = normalize_label(pred_raw)
+    if not pred_norm:
+        return ""
+
+    name_to_idx = _class_name_to_idx()
+    if pred_norm in name_to_idx:
+        return pred_norm
+
+    # Strip simple punctuation around words for cases like "cat." or "a cat".
+    cleaned = pred_norm.replace(",", " ").replace(".", " ").replace(":", " ").replace(";", " ")
+    cleaned = " ".join(cleaned.split())
+    if cleaned in name_to_idx:
+        return cleaned
+
+    # Prefer longest names first ("traffic light" before "light", etc.).
+    categories_sorted = sorted(COCO_CATEGORIES, key=len, reverse=True)
+    padded = f" {cleaned} "
+    for name in categories_sorted:
+        token = f" {name} "
+        if token in padded:
+            return name
+    return ""
+
+
 def _generate_answer(
     model,
     processor,
@@ -85,7 +114,8 @@ def _build_confusion_and_lists(
         t_idx = name_to_idx.get(gt)
         if t_idx is None:
             continue
-        p_idx = pred_to_class_index(normalize_label(pred_raw))
+        p_label = extract_predicted_class(pred_raw)
+        p_idx = pred_to_class_index(p_label)
         cm[t_idx, p_idx] += 1
         y_true.append(t_idx)
         y_pred.append(p_idx)
@@ -195,7 +225,7 @@ def run_phase1_evaluation(
         overall_correct = sum(
             1
             for s, p in zip(samples, preds)
-            if normalize_label(p) == normalize_label(s["label"])
+            if extract_predicted_class(p) == normalize_label(s["label"])
         )
         overall_acc = overall_correct / max(1, len(samples))
 
@@ -208,7 +238,7 @@ def run_phase1_evaluation(
             if b not in bucket_stats:
                 bucket_stats[b] = {"total": 0, "correct": 0}
             bucket_stats[b]["total"] += 1
-            if normalize_label(p) == normalize_label(s["label"]):
+            if extract_predicted_class(p) == normalize_label(s["label"]):
                 bucket_stats[b]["correct"] += 1
         bucket_accuracy = {
             k: {
@@ -221,11 +251,14 @@ def run_phase1_evaluation(
 
         errors_sample: List[Dict[str, str]] = []
         for s, p in zip(samples, preds):
-            if normalize_label(p) != normalize_label(s["label"]):
+            pred_label = extract_predicted_class(p)
+            gt_label = normalize_label(s["label"])
+            if pred_label != gt_label:
                 errors_sample.append(
                     {
-                        "ground_truth": normalize_label(s["label"]),
-                        "prediction": normalize_label(p),
+                        "ground_truth": gt_label,
+                        "prediction": pred_label,
+                        "raw_prediction": normalize_label(p),
                         "prompt": s["prompt"],
                     }
                 )

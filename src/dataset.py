@@ -213,14 +213,12 @@ def _extract_objects(item):
 
 
 def _format_bbox_prompt(x1, y1, x2, y2, width, height):
-    x1_q = int(x1 / width * 999)
-    y1_q = int(y1 / height * 999)
-    x2_q = int(x2 / width * 999)
-    y2_q = int(y2 / height * 999)
-    return (
-        f"Given bbox [{x1},{y1},{x2},{y2}], "
-        "name the object category with one word."
-    )
+    # Florence location tokens are quantized to a 0..999 grid.
+    x1_q = max(0, min(999, int(x1 / width * 999)))
+    y1_q = max(0, min(999, int(y1 / height * 999)))
+    x2_q = max(0, min(999, int(x2 / width * 999)))
+    y2_q = max(0, min(999, int(y2 / height * 999)))
+    return f"<REGION_TO_CATEGORY><loc_{x1_q}><loc_{y1_q}><loc_{x2_q}><loc_{y2_q}>"
 
 
 def prepare_coco_bbox_data(
